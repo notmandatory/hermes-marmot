@@ -1,0 +1,47 @@
+name: marmot-platform
+label: Marmot
+kind: platform
+version: 1.0.0
+description: >
+  Marmot Protocol gateway adapter for Hermes Agent.
+  End-to-end encrypted Nostr messaging via MLS (RFC 9420).
+  Uses the marmot-cli daemon for JSON-RPC communication with Nostr relays.
+author: Hermes
+requires_env:
+  - name: MARMOT_CLI_PATH
+    description: "Path to marmot-cli binary (default: marmot-cli)"
+    prompt: "marmot-cli path"
+    password: false
+  - name: MARMOT_IDENTITY
+    description: "marmot-cli identity name (default: default)"
+    prompt: "Identity name"
+    password: false
+optional_env:
+  - name: MARMOT_DAEMON_HOST
+    description: "marmot-cli daemon host (default: 127.0.0.1)"
+    prompt: "Daemon host"
+    password: false
+  - name: MARMOT_DAEMON_PORT
+    description: "marmot-cli daemon JSON-RPC port (default: 9222)"
+    prompt: "Daemon port"
+    password: false
+  - name: MARMOT_AUTO_START
+    description: "Auto-start marmot-cli daemon (1/true/yes to enable, default: true)"
+    prompt: "Auto-start daemon?"
+    password: false
+  - name: MARMOT_ALLOWED_USERS
+    description: "Comma-separated npubs allowed to DM the agent"
+    prompt: "Allowed npubs (comma-separated)"
+    password: false
+  - name: MARMOT_ALLOW_ALL_USERS
+    description: "Allow anyone to DM the agent (dev only)"
+    prompt: "Allow all users?"
+    password: false
+  - name: MARMOT_POLL_INTERVAL_MS
+    description: "Poll interval in milliseconds (default: 5000)"
+    prompt: "Poll interval (ms)"
+    password: false
+  - name: MARMOT_HOME_CHANNEL
+    description: "Default chat for cron / notification delivery (npub or group:hex)"
+    prompt: "Home channel npub"
+    password: false
