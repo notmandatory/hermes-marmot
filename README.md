@@ -2,78 +2,39 @@
 
 End-to-end encrypted Nostr messaging via MLS (RFC 9420) for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 
-This plugin connects Hermes to the [marmot-cli](https://github.com/tkhumush/marmot-cli) daemon, which manages MLS-encrypted group chats over Nostr relays. Users can DM the Hermes agent from any Nostr client that supports kind 445 MLS messages (e.g. [Whitenoise](https://whitenoise.chat)).
+This plugin uses [mdk-python](https://github.com/marmot-protocol/mdk-python) (Marmot Development Kit) to manage MLS-encrypted group chats over Nostr relays directly — no external daemon required. Inbound DMs use [NIP-59](https://github.com/nostr-protocol/nips/blob/master/59.md) gift wrap unwrapping via [nostr-sdk](https://github.com/rust-nostr/nostr) (Python bindings). Users can DM the Hermes agent from any Nostr client that supports kind 445 MLS messages (e.g. [Whitenoise](https://whitenoise.chat)).
 
 ## Requirements
 
 - Python 3.10+
 - Hermes Agent installed and configured
-- `marmot-cli` binary (v0.1.0+) in PATH — build from [marmot-cli](https://github.com/tkhumush/marmot-cli)
+- `pip install mdk-python nostr websockets nostr-sdk`
 
 ## Quick Start
 
-### 1. Install the plugin
+### 1. Install dependencies
+
+```bash
+# Activate hermes venv and install
+/home/hermes/.hermes/hermes-agent/venv/bin/python3 -m pip install mdk-python nostr websockets nostr-sdk
+```
+
+### 2. Install the plugin
 
 ```bash
 mkdir -p ~/.hermes/plugins
 ln -s /path/to/hermes-marmot ~/.hermes/plugins/marmot
 ```
 
-### 2. Configure
+### 3. Start the gateway
 
-Run the interactive setup:
-
-```bash
-hermes setup
-```
-
-Or set environment variables directly in `~/.hermes/.env`:
-
-```env
-MARMOT_CLI_PATH=marmot-cli
-MARMOT_IDENTITY=default
-MARMOT_DAEMON_HOST=127.0.0.1
-MARMOT_DAEMON_PORT=9222
-MARMOT_AUTO_START=true
-MARMOT_POLL_INTERVAL_MS=5000
-MARMOT_HOME_CHANNEL=npub1...
-MARMOT_ALLOWED_USERS=npub1friend1,npub1friend2
-MARMOT_ALLOW_ALL_USERS=false
-```
-
-Or via `config.yaml`:
-
-```yaml
-gateway:
-  platforms:
-    marmot:
-      enabled: true
-      extra:
-        cli_path: marmot-cli
-        identity: default
-        host: 127.0.0.1
-        port: 9222
-        auto_start: true
-        poll_interval_ms: 5000
-        home_channel: npub1...
-        allowed_users:
-          - npub1...
-          - npub2...
-```
-
-### 3. Set a display name (so Nostr clients show a name, not an npub)
-
-```bash
-marmot-cli profile update --display-name "Hermes" --name "hermes" --about "Hermes AI Agent"
-```
-
-### 4. Start the gateway
+A Nostr identity and MDK database are auto-created on first start.
 
 ```bash
 hermes gateway start
 ```
 
-### 5. Find your agent's npub
+### 4. Find your agent's npub
 
 ```bash
 hermes marmot identity
@@ -81,15 +42,14 @@ hermes marmot identity
 
 Share this npub with friends so they can start a DM with your agent.
 
-### 6. Optional: Set home channel
-
-The home channel is where cron jobs, notifications, and agent-initiated messages are delivered.
+### 5. Allow users to DM the agent
 
 ```bash
-hermes marmot groups
-# Find the group hex of your DM with the agent, then:
-export MARMOT_HOME_CHANNEL=<group-hex>
+export MARMOT_ALLOWED_USERS=npub1friend1,npub1friend2
+hermes gateway restart
 ```
+
+Or set `MARMOT_ALLOW_ALL_USERS=true` for open access (dev only).
 
 ## Usage
 
@@ -98,13 +58,12 @@ export MARMOT_HOME_CHANNEL=<group-hex>
 ```bash
 hermes marmot identity                 # Print agent's npub and hex pubkey
 hermes marmot groups                   # List all encrypted groups
-hermes marmot group create --name "My Group" --member npub1...   # Create group
-hermes marmot group invite --group <hex> --member <npub>        # Invite member
-hermes marmot group members --group <hex>                       # List members
-hermes marmot dm <npub>                # Create a 2-member DM with someone
-hermes marmot send <group-hex> "hello" # Send a message (debug)
-hermes marmot status                   # Check daemon connectivity
-hermes marmot receive                  # View buffered events (debug)
+hermes marmot group create --name "My Group"   # Create a group
+hermes marmot group members --group <hex>       # List members
+hermes marmot send <group-hex> "hello" # Send a message
+hermes marmot status                   # Check MDK and identity
+hermes marmot receive                  # View/accept pending welcomes
+hermes marmot profile set --name "Bot" # Set Nostr display name
 ```
 
 ### DM the agent from Whitenoise
@@ -117,70 +76,90 @@ hermes marmot receive                  # View buffered events (debug)
 ## Architecture
 
 ```
-┌──────────────┐     JSON-RPC/TCP     ┌──────────────┐     WebSocket      ┌──────────┐
-│  Hermes      │ ◄──────────────────► │ marmot-cli   │ ◄────────────────► │ Nostr    │
-│  Adapter     │   ping, send_msg,    │ Daemon        │   kind 445 events  │ Relays   │
-│  (Python)    │   list_groups,       │ (Rust)        │                    │ (nos.lol,│
-│              │   receive            │               │                    │  damus,  │
-│              │                      │               │                    │  primal) │
-└──────────────┘                      └──────────────┘                    └──────────┘
-       │                                     │
-       │  subprocess                          │  MLS (RFC 9420)
-       │  marmot-cli groups messages          │  encryption layer
-       │  marmot-cli receive                  │
-       ▼                                     ▼
-  Poll loop syncs                    Persistent relay
-  MLS epoch and fetches              connections with
-  new messages                       live subscriptions
+┌──────────────┐     direct call     ┌──────────────────┐  kind 445/1059   ┌──────────┐
+│  Hermes      │ ◄─────────────────► │  mdk-python      │ ◄──────────────► │ Nostr    │
+│  Adapter     │   create_message,   │  (Python bindings│  WebSocket       │ Relays   │
+│  (Python)    │   process_message,  │   to Rust MDK)   │                  │ (nos.lol,│
+│              │   get_messages      │                  │                  │  damus,  │
+│              │                     │                  │                  │  primal) │
+└──────┬───────┘                     └──────────────────┘                  └──────────┘
+       │
+       │  Inbound — kind 445 group messages:
+       │  ┌────────────────────────────────────────┐
+       ├─►│ kind 445 → mdk.process_message()       │
+       │  │ → decrypt → plaintext                  │
+       │  └────────────────────────────────────────┘
+       │
+       │  Inbound — kind 1059 gift wraps (welcomes):
+       │  ┌────────────────────────────────────────┐
+       ├─►│ UnwrappedGift.from_gift_wrap()         │
+       │  │ → kind 13 seal → decrypt → kind 444    │
+       │  │ → mdk.process_welcome()                │
+       │  │ → mdk.accept_welcome()                 │
+       │  └────────────────────────────────────────┘
+       │
+       │  Outbound — kind 445 + gift-wrap copies:
+       │  ┌────────────────────────────────────────┐
+       ├─►│ mdk.create_message() → kind 445 event  │
+       │  │ → publish to relays                    │
+       │  │ → gift-wrap (kind 1059, current ts)    │
+       │  │   for compatible clients               │
+       │  └────────────────────────────────────────┘
+       │
+       │  Nostr identity            MLS (RFC 9420)
+       │  file-based key            encryption layer
+       ▼                           
+  Secp256k1 keypair          SQLite database
+  stored in ~/.hermes/       stores groups, keys,
+  marmot-identity.sec        messages, MLS state
 ```
 
 ### How it works
 
-- **Inbound**: The adapter periodically runs `marmot-cli receive` to sync MLS commits, then parses `marmot-cli groups messages --group <hex> --after <ts>` for new messages. Parsed messages are dispatched to the agent's message handler.
-- **Outbound**: When the agent sends a response, the adapter calls `receive` RPC first to process any pending MLS commits, then calls `send_message` RPC to encrypt and publish the reply.
-- **Identity**: The daemon manages a single Nostr keypair. A kind 0 profile event can be published to set a display name.
-- **Relays**: All 3 relays are configured at daemon build time (`wss://nos.lol`, `wss://relay.damus.io`, `wss://relay.primal.net`). Inbox/key-package relay lists are published on startup.
+- **No daemon**: MDK is a Python library wrapping the Rust MDK core via UniFFI. All MLS operations (key generation, encrypt/decrypt, group management) happen in-process.
+- **Inbound — messages**: The adapter subscribes to kind 445 events with a `since` filter built from the last processed event timestamp (persisted to `~/.hermes/marmot-last-event.ts`). `mdk.process_message()` decrypts them and returns `Message` objects. A periodic sync loop catches missed messages via `mdk.get_messages()`.
+- **Inbound — welcomes**: New group invitations arrive as [NIP-59](https://github.com/nostr-protocol/nips/blob/master/59.md) gift wraps (kind 1059). The adapter subscribes to kind 1059 events tagged to our pubkey and unwraps them via `nostr_sdk.UnwrappedGift.from_gift_wrap()`, extracting the kind 444 MLS welcome rumor. It then calls `mdk.process_welcome()` → `mdk.accept_welcome()` to join the group.
+- **Outbound**: `mdk.create_message()` encrypts the message and returns a complete, signed Nostr event JSON (kind 445), published to all connected relays. Gift-wrap copies (kind 1059) are also published with the current timestamp (`_create_gift_wrap_with_current_ts()`) — nostr-sdk's built-in `gift_wrap()` randomizes timestamps per NIP-59, which can cause misses when recipients use `since` filters.
+- **Identity**: A secp256k1 keypair is generated on first start and stored at `~/.hermes/marmot-identity.sec`. The hex pubkey is derived from it for MDK and NIP-59 operations.
+- **Key packages**: On each connect, a fresh MLS key package (kind 30443, replaceable) is published to relays so other clients can find and add this agent to groups.
+- **Group evolution**: For groups with 2 or fewer members, automatic self-update proposals are skipped to prevent unnecessary epoch drift. Periodic sync (`mdk.get_messages()`) handles message catching across restarts.
+- **Relays**: WebSocket connections to 3 relays (nos.lol, damus.io, primal.net) for real-time event streaming.
 
-## Configuration Reference
+## Configuration
 
-| Variable | Default | Description |
+| Env Variable | Default | Description |
 |---|---|---|
-| `MARMOT_CLI_PATH` | `marmot-cli` | Path to the marmot-cli binary |
-| `MARMOT_IDENTITY` | `default` | Identity name in marmot-cli |
-| `MARMOT_DAEMON_HOST` | `127.0.0.1` | Daemon listen host |
-| `MARMOT_DAEMON_PORT` | `9222` | Daemon JSON-RPC port |
-| `MARMOT_AUTO_START` | `true` | Auto-spawn daemon subprocess |
-| `MARMOT_POLL_INTERVAL_MS` | `5000` | Message poll interval |
-| `MARMOT_HOME_CHANNEL` | — | Default channel for notifications/cron |
+| `MARMOT_RELAYS` | `wss://nos.lol,wss://relay.damus.io,wss://relay.primal.net` | Comma-separated relay URLs |
+| `MARMOT_IDENTITY_PATH` | `~/.hermes/marmot-identity.sec` | Path to 32-byte identity private key |
+| `MARMOT_DB_PATH` | `~/.hermes/marmot-mdk.db` | Path to MDK SQLite database |
+| `MARMOT_DB_KEY_PATH` | `~/.hermes/marmot-db.key` | Path to 32-byte DB encryption key |
+| `MARMOT_HOME_CHANNEL` | — | Default group hex for notifications/cron |
 | `MARMOT_ALLOWED_USERS` | — | Comma-separated npubs allowed to DM |
 | `MARMOT_ALLOW_ALL_USERS` | `false` | Allow anyone to DM (dev only) |
 
 ## Troubleshooting
 
 **Agent doesn't respond to DMs:**
-- Check `hermes marmot status` — daemon must be connected
+- Check `hermes marmot status` — identity and MDK must be loaded
 - Verify `hermes marmot groups` shows the DM group
 - Confirm the sender's npub is in `MARMOT_ALLOWED_USERS` or `MARMOT_ALLOW_ALL_USERS=true`
 - Check `~/.hermes/logs/gateway.log` for polling or dispatch errors
 
-**Outbound messages don't reach relays:**
-- The adapter calls `receive` before `send_message` to sync MLS epoch
-- If messages still fail, restart the daemon: `hermes marmot status` (auto-restarts on crash)
-
-**"Wrong Epoch" errors in daemon logs:**
-- MLS commits from other members must be processed before sending
-- The adapter handles this automatically by calling `receive` before each send
+**Messages arrive but responses don't reach Whitenoise:**
+- MDK creates and signs kind 445 events internally — no external signing needed
+- Check relay connectivity in logs
+- Verify key packages are published (logged on connect)
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `plugin.yaml` | Plugin metadata and env config schema |
+| `plugin.yaml` | Plugin metadata, env config, pip dependencies |
 | `__init__.py` | Plugin entry point, registers CLI + platform |
-| `adapter.py` | Main adapter: poll loop, message dispatch, send |
-| `daemon.py` | Daemon subprocess lifecycle and auto-restart |
-| `rpc_client.py` | JSON-RPC 2.0 client (TCP) |
-| `cli.py` | `hermes marmot` CLI subcommands |
+| `adapter.py` | Main adapter: MDK lifecycle, relay comms, message dispatch, NIP-59 gift wrap handling |
+| `nostr_relay.py` | Async WebSocket Nostr relay client (NIP-01) |
+| `cli.py` | `hermes marmot` CLI subcommands (identity, groups, send, profile, receive) |
+| `~/.hermes/marmot-last-event.ts` | Persisted timestamp of the last processed event (used for since filter on reconnect) |
 
 ## License
 

@@ -4,13 +4,12 @@ Wires ``hermes marmot <subcommand>``:
 
   identity        — print the agent's own npub and hex pubkey
   groups          — list all encrypted groups
-  groups create   — create a new MLS group
-  groups invite   — invite a member by npub
-  groups members  — list members of a group
-  dm <npub>       — create a 2-member DM group with an npub
+  group create    — create a new MLS group
+  group invite    — invite a member by npub
+  group members   — list members of a group
   send            — send a message to a group
-  status          — check daemon connectivity and identity
-  receive         — print buffered events (for debugging)
+  status          — check MDK connectivity and identity
+  receive         — check pending welcomes (debug)
 """
 
 from __future__ import annotations
@@ -19,65 +18,74 @@ import argparse
 import asyncio
 import json
 import os
-import subprocess
 import sys
+from pathlib import Path
 
-from .rpc_client import MarmotRpcClient
-
-
-def _get_client() -> MarmotRpcClient:
-    host = os.getenv("MARMOT_DAEMON_HOST") or "127.0.0.1"
-    port = int(os.getenv("MARMOT_DAEMON_PORT") or "9222")
-    return MarmotRpcClient(host=host, port=port)
-
-
-def _cli_path() -> str:
-    return os.getenv("MARMOT_CLI_PATH") or "marmot-cli"
-
-
-def _run_marmot_cli(*args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        [_cli_path(), *args],
-        capture_output=True, text=True,
-    )
+HOME = Path.home()
+DEFAULT_IDENTITY_PATH = HOME / ".hermes" / "marmot-identity.sec"
+DEFAULT_DB_PATH = HOME / ".hermes" / "marmot-mdk.db"
+DEFAULT_DB_KEY_PATH = HOME / ".hermes" / "marmot-db.key"
+RELAY_URLS = [
+    "wss://nos.lol",
+    "wss://relay.damus.io",
+    "wss://relay.primal.net",
+]
 
 
-async def _rpc_npub() -> dict:
-    return await _get_client().identity_npub()
+def _get_identity() -> tuple[str, bytes]:
+    path = Path(os.getenv("MARMOT_IDENTITY_PATH") or DEFAULT_IDENTITY_PATH)
+    raw = path.read_bytes()
+    from nostr_sdk import SecretKey, Keys
+    sk = SecretKey.from_bytes(raw)
+    keys = Keys(sk)
+    pubkey_hex = keys.public_key().to_hex()
+    npub = keys.public_key().to_bech32()
+    return npub, pubkey_hex
 
 
-async def _rpc_list_groups() -> dict:
-    return await _get_client().list_groups()
+def _get_mdk():
+    from mdk import new_mdk_with_key
+    db_path = Path(os.getenv("MARMOT_DB_PATH") or DEFAULT_DB_PATH)
+    db_key_path = Path(os.getenv("MARMOT_DB_KEY_PATH") or DEFAULT_DB_KEY_PATH)
+    if db_key_path.exists():
+        db_key = db_key_path.read_bytes()
+    else:
+        import secrets
+        db_key = secrets.token_bytes(32)
+        db_key_path.parent.mkdir(parents=True, exist_ok=True)
+        db_key_path.write_bytes(db_key)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    return new_mdk_with_key(db_path=str(db_path), encryption_key=db_key, config=None)
 
 
-async def _rpc_send(group_id: str, content: str) -> dict:
-    return await _get_client().send_message(group_id=group_id, content=content, publish=True)
+def _get_relays():
+    import sys
+    from pathlib import Path
+    _here = Path(__file__).parent
+    if str(_here) not in sys.path:
+        sys.path.insert(0, str(_here))
+    from nostr_relay import RelayManager
+    urls = RELAY_URLS
+    env_relays = os.getenv("MARMOT_RELAYS")
+    if env_relays:
+        urls = [u.strip() for u in env_relays.split(",") if u.strip()]
+    return RelayManager(urls)
 
 
-async def _rpc_ping() -> dict:
-    return await _get_client().ping()
-
-
-async def _rpc_receive() -> dict:
-    return await _get_client().receive()
-
-
-def _run(coro):
-    try:
-        return asyncio.run(coro)
-    except KeyboardInterrupt:
-        return 130
+def _pubkey_to_npub(hex_pubkey: str) -> str:
+    from nostr_sdk import PublicKey
+    return PublicKey.parse(hex_pubkey).to_bech32()
 
 
 # ---------------------------------------------------------------------------
 # argparse wiring
 # ---------------------------------------------------------------------------
 
+
 def register_cli(subparser: argparse.ArgumentParser) -> None:
     subs = subparser.add_subparsers(dest="marmot_command")
 
     subs.add_parser("identity", help="Print the agent's npub and hex pubkey")
-
     subs.add_parser("groups", help="List all encrypted groups")
 
     groups_p = subs.add_parser("group", help="Group management subcommands")
@@ -86,29 +94,32 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     gc_p = gsubs.add_parser("create", help="Create a new MLS group")
     gc_p.add_argument("--name", "-n", required=True, help="Group name")
     gc_p.add_argument("--description", "-d", default="", help="Group description")
-    gc_p.add_argument("--member", "-m", action="append", dest="members", help="Invite member on creation (repeatable)")
-    gc_p.add_argument("--publish", action="store_true", default=True, help="Publish to relays")
+    gc_p.add_argument("--member", "-m", action="append", dest="members", help="Invite member on creation")
+    gc_p.add_argument("--relay", action="append", dest="cli_relays", help="Relay URL (repeatable)")
 
     gi_p = gsubs.add_parser("invite", help="Invite a member by npub")
     gi_p.add_argument("--group", "-g", required=True, help="Group ID (hex)")
     gi_p.add_argument("--member", "-m", required=True, help="Npub of the person to invite")
-    gi_p.add_argument("--publish", action="store_true", default=True, help="Publish to relays")
 
     gm_p = gsubs.add_parser("members", help="List members of a group")
     gm_p.add_argument("--group", "-g", required=True, help="Group ID (hex)")
 
     groups_p.set_defaults(func=marmot_group_command)
 
-    dm_p = subs.add_parser("dm", help="Create a 2-member DM with an npub")
-    dm_p.add_argument("npub", help="Npub of the recipient")
-
     send_p = subs.add_parser("send", help="Send a message to a group")
     send_p.add_argument("group_id", help="Group ID (hex)")
     send_p.add_argument("message", help="Message text to send")
 
-    subs.add_parser("status", help="Check daemon connectivity and config")
+    profile_p = subs.add_parser("profile", help="Manage Nostr profile")
+    profile_sub = profile_p.add_subparsers(dest="marmot_profile_command")
+    set_p = profile_sub.add_parser("set", help="Set profile fields (name, about, picture)")
+    set_p.add_argument("--name", help="Display name")
+    set_p.add_argument("--about", help="Short bio")
+    set_p.add_argument("--picture", help="Profile image URL")
+    profile_p.set_defaults(func=marmot_profile_command)
 
-    subs.add_parser("receive", help="Show buffered events from daemon (debug)")
+    subs.add_parser("status", help="Check MDK connectivity and identity")
+    subs.add_parser("receive", help="Show pending welcomes (debug)")
 
     subparser.set_defaults(func=marmot_command)
 
@@ -117,10 +128,11 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
 # Dispatch
 # ---------------------------------------------------------------------------
 
+
 def marmot_command(args: argparse.Namespace) -> int:
     sub = getattr(args, "marmot_command", None)
     if not sub:
-        print("usage: hermes marmot {identity,groups,group,dm,send,status,receive}")
+        print("usage: hermes marmot {identity,groups,group,send,status,receive}")
         print()
         print("subcommands:")
         print("  identity              print the agent's npub and hex pubkey")
@@ -128,10 +140,9 @@ def marmot_command(args: argparse.Namespace) -> int:
         print("  group create          create a new MLS group")
         print("  group invite          invite a member by npub")
         print("  group members         list members of a group")
-        print("  dm <npub>             create a 2-member DM with an npub")
         print("  send <group-id> <msg> send a message to a group")
-        print("  status                check daemon connectivity")
-        print("  receive               view buffered events (debug)")
+        print("  status                check MDK connectivity")
+        print("  receive               show pending welcomes (debug)")
         return 2
     if sub == "identity":
         return _cmd_identity()
@@ -143,15 +154,27 @@ def marmot_command(args: argparse.Namespace) -> int:
             print("usage: hermes marmot group {create,invite,members}")
             return 2
         return fn(args)
-    if sub == "dm":
-        return _cmd_dm(args.npub)
     if sub == "send":
-        return _cmd_send(group_id=args.group_id, message=args.message)
+        return _cmd_send(args.group_id, args.message)
     if sub == "status":
         return _cmd_status()
     if sub == "receive":
         return _cmd_receive()
+    if sub == "profile":
+        fn = getattr(args, "func", None)
+        if fn is None or fn is marmot_command:
+            print("usage: hermes marmot profile {set}")
+            return 2
+        return fn(args)
     print(f"unknown subcommand: {sub}")
+    return 2
+
+
+def marmot_profile_command(args: argparse.Namespace) -> int:
+    sub = getattr(args, "marmot_profile_command", None)
+    if sub == "set":
+        return _cmd_profile_set(args.name, args.about, args.picture)
+    print("usage: hermes marmot profile set --name <name> [--about <text>] [--picture <url>]")
     return 2
 
 
@@ -166,9 +189,10 @@ def marmot_group_command(args: argparse.Namespace) -> int:
         print("  members   list group members      --group <hex>")
         return 2
     if sub == "create":
-        return _cmd_group_create(name=args.name, description=args.description, members=args.members, publish=args.publish)
+        relays = args.cli_relays or RELAY_URLS
+        return _cmd_group_create(args.name, args.description, args.members, relays)
     if sub == "invite":
-        return _cmd_group_invite(group_id=args.group, npub=args.member, publish=args.publish)
+        return _cmd_group_invite(args.group, args.member)
     if sub == "members":
         return _cmd_group_members(args.group)
     print(f"unknown group subcommand: {sub}")
@@ -179,162 +203,264 @@ def marmot_group_command(args: argparse.Namespace) -> int:
 # Handlers
 # ---------------------------------------------------------------------------
 
+
 def _cmd_identity() -> int:
-    async def _work():
-        try:
-            result = await _rpc_npub()
-        except Exception as e:
-            print(f"error: cannot reach marmot daemon — {e}")
-            return 1
-        npub = (result or {}).get("npub", "")
-        pubkey = (result or {}).get("pubkey", "")
-        if not npub and not pubkey:
-            print("no identity returned (daemon may not have a key)")
-            return 1
-        if npub:
-            print(f"npub:   {npub}")
-        if pubkey:
-            print(f"hex:    {pubkey}")
+    try:
+        npub, hex_pk = _get_identity()
+        print(f"npub:   {npub}")
+        print(f"hex:    {hex_pk}")
         return 0
-    return _run(_work())
+    except Exception as e:
+        print(f"error: cannot load identity — {e}")
+        return 1
 
 
 def _cmd_groups() -> int:
-    async def _work():
-        try:
-            result = await _rpc_list_groups()
-        except Exception as e:
-            print(f"error: cannot reach marmot daemon — {e}")
-            return 1
-        groups = (result or {}).get("groups", [])
-        if not groups:
-            print("no groups")
-            return 0
-        for g in groups:
-            if isinstance(g, dict):
-                gid = g.get("id", "")
-                name = g.get("name", "")
-                n = g.get("members", 0)
-                print(f"  {gid}  {name}  ({n} members)" if name else f"  {gid}  ({n} members)")
-            else:
-                print(f"  {g}")
+    try:
+        instance = _get_mdk()
+    except Exception as e:
+        print(f"error: cannot initialize MDK — {e}")
+        return 1
+    groups = instance.get_groups()
+    if not groups:
+        print("no groups")
         return 0
-    return _run(_work())
+    for g in groups:
+        name = g.name or ""
+        desc = g.description or ""
+        n = len(instance.get_members(mls_group_id=g.mls_group_id)) if hasattr(instance, 'get_members') else 0
+        line = f"  {g.mls_group_id}"
+        if name:
+            line += f"  {name}"
+        print(f"{line}  ({n} members)")
+    return 0
 
 
-def _cmd_group_create(name: str, description: str = "", members: list | None = None, publish: bool = True) -> int:
+def _cmd_group_create(name: str, description: str, members: list | None, relays: list) -> int:
     if not (name or "").strip():
         print("error: group name is required")
         return 2
-    argv = ["groups", "create", "--name", name]
-    if description:
-        argv += ["--description", description]
+    try:
+        instance = _get_mdk()
+    except Exception as e:
+        print(f"error: cannot initialize MDK — {e}")
+        return 1
+
+    _, pubkey_hex = _get_identity()
+
+    member_events = []
     if members:
-        for m in members:
-            argv += ["--member", m]
-    if publish:
-        argv.append("--publish")
-    result = _run_marmot_cli(*argv)
-    if result.returncode != 0:
-        print(result.stderr.strip() or f"failed (exit {result.returncode})")
-        return result.returncode
-    out = result.stdout.strip()
-    print(out if out else f"group '{name}' created")
+        for npub in members:
+            print(f"  need key package for {npub} to add them at creation time")
+            print(f"  use 'hermes marmot group invite' after creating the group")
+
+    try:
+        result = instance.create_group(
+            creator_public_key=pubkey_hex,
+            member_key_package_events_json=member_events,
+            name=name,
+            description=description or "",
+            relays=relays,
+            admins=[pubkey_hex],
+        )
+    except Exception as e:
+        print(f"error: failed to create group — {e}")
+        return 1
+
+    group = result.group
+    print(f"group created: {group.mls_group_id}")
+    if group.name:
+        print(f"  name: {group.name}")
+
+    if result.welcome_rumors_json:
+        print(f"  welcome messages: {len(result.welcome_rumors_json)}")
+
     return 0
 
 
-def _cmd_group_invite(group_id: str, npub: str, publish: bool = True) -> int:
+def _cmd_group_invite(group_id: str, npub: str) -> int:
     if not group_id or not npub:
         print("error: group_id and npub are required")
         return 2
-    argv = ["groups", "invite", "--group", group_id, "--member", npub]
-    if publish:
-        argv.append("--publish")
-    result = _run_marmot_cli(*argv)
-    if result.returncode != 0:
-        print(result.stderr.strip() or f"invite failed (exit {result.returncode})")
-        return result.returncode
-    print(result.stdout.strip() if result.stdout.strip() else f"invited {npub} to {group_id}")
-    return 0
+
+    from nostr_sdk import Nip19
+    try:
+        result = Nip19.from_bech32(npub)
+        member_hex = result.as_enum().npub.to_hex()
+    except Exception as e:
+        print(f"error: invalid npub — {e}")
+        return 1
+
+    try:
+        instance = _get_mdk()
+    except Exception as e:
+        print(f"error: cannot initialize MDK — {e}")
+        return 1
+
+    print(f"  fetching key package for {npub} from relays...")
+    print(f"  (key package fetching not yet implemented — use the gateway)")
+    return 1
 
 
 def _cmd_group_members(group_id: str) -> int:
-    result = _run_marmot_cli("groups", "members", "--group", group_id)
-    if result.returncode != 0:
-        print(result.stderr.strip() or f"failed (exit {result.returncode})")
-        return result.returncode
-    out = result.stdout.strip()
-    print(out if out else "no members or group not found")
-    return 0
-
-
-def _cmd_dm(npub: str) -> int:
-    if not npub:
-        print("error: npub is required")
-        return 2
-    result = _run_marmot_cli("dm", "create", "--recipient", npub, "--publish")
-    if result.returncode != 0:
-        print(result.stderr.strip() or f"DM failed (exit {result.returncode})")
-        return result.returncode
-    print(result.stdout.strip() if result.stdout.strip() else f"DM created with {npub}")
+    try:
+        instance = _get_mdk()
+    except Exception as e:
+        print(f"error: cannot initialize MDK — {e}")
+        return 1
+    try:
+        members = instance.get_members(mls_group_id=group_id)
+    except Exception as e:
+        print(f"error: cannot get members — {e}")
+        return 1
+    if not members:
+        print("no members or group not found")
+        return 0
+    _, my_hex = _get_identity()
+    for m in members:
+        label = "(you)" if m == my_hex else ""
+        print(f"  {_pubkey_to_npub(m)}  {label}")
     return 0
 
 
 def _cmd_send(group_id: str, message: str) -> int:
+    if not group_id or not message:
+        print("error: group_id and message are required")
+        return 2
+
     async def _work():
         try:
-            result = await _rpc_send(group_id, message)
+            instance = _get_mdk()
         except Exception as e:
-            print(f"error: failed to send — {e}")
+            print(f"error: cannot initialize MDK — {e}")
             return 1
-        event_id = (result or {}).get("id", "")
-        print(f"sent: {event_id}" if event_id else "sent (no event id returned)")
+
+        _, pubkey_hex = _get_identity()
+
+        try:
+            event_json = instance.create_message(
+                mls_group_id=group_id,
+                sender_public_key=pubkey_hex,
+                content=message,
+                kind=9,
+                tags=None,
+                event_tags=None,
+            )
+        except Exception as e:
+            print(f"error: failed to create message — {e}")
+            return 1
+
+        relays = _get_relays()
+        await relays.connect_all()
+        await relays.publish_all(event_json)
+        await relays.disconnect_all()
+
+        print(f"sent: {group_id[:16]}...")
         return 0
-    return _run(_work())
+
+    try:
+        return asyncio.run(_work())
+    except KeyboardInterrupt:
+        return 130
 
 
 def _cmd_status() -> int:
-    async def _work():
-        host = os.getenv("MARMOT_DAEMON_HOST") or "127.0.0.1"
-        port = int(os.getenv("MARMOT_DAEMON_PORT") or "9222")
-        cli_path = os.getenv("MARMOT_CLI_PATH") or "(not set)"
-        identity = os.getenv("MARMOT_IDENTITY") or "default"
-        print(f"cli_path:    {cli_path}")
-        print(f"identity:    {identity}")
-        print(f"daemon:      {host}:{port}")
-        print()
-        try:
-            ping = await _rpc_ping()
-            if ping.get("pong"):
-                print("daemon:      connected")
-            else:
-                print("daemon:      connected but unexpected response")
-        except Exception as e:
-            print(f"daemon:      unreachable — {e}")
-            return 1
-        try:
-            ident = await _rpc_npub()
-            npub = (ident or {}).get("npub", "")
-            if npub:
-                print(f"npub:        {npub}")
-        except Exception:
-            pass
-        return 0
-    return _run(_work())
+    try:
+        npub, hex_pk = _get_identity()
+        print(f"identity:")
+        print(f"  npub:   {npub}")
+        print(f"  hex:    {hex_pk}")
+    except Exception as e:
+        print(f"identity:  NOT FOUND — {e}")
+        return 1
+
+    try:
+        instance = _get_mdk()
+        groups = instance.get_groups()
+        print(f"\nmdk:")
+        print(f"  groups:   {len(groups)}")
+        print(f"  db:       {os.getenv('MARMOT_DB_PATH') or DEFAULT_DB_PATH}")
+    except Exception as e:
+        print(f"\nmdk:       ERROR — {e}")
+        return 1
+
+    return 0
 
 
 def _cmd_receive() -> int:
-    async def _work():
-        try:
-            result = await _rpc_receive()
-        except Exception as e:
-            print(f"error: cannot reach marmot daemon — {e}")
-            return 1
-        events = (result or {}).get("events", [])
-        if not events:
-            print("no pending events")
-            return 0
-        for ev in events:
-            print(json.dumps(ev, indent=2))
+    try:
+        instance = _get_mdk()
+    except Exception as e:
+        print(f"error: cannot initialize MDK — {e}")
+        return 1
+
+    pending = instance.get_pending_welcomes()
+    if pending:
+        print(f"found {len(pending)} pending welcome(s):")
+        for w in pending:
+            print(f"  group: {w.group_name or '(unnamed)'} ({w.mls_group_id[:16]}...)")
+            print(f"  from:  {_pubkey_to_npub(w.welcomer)}")
+            print(f"  relays: {', '.join(w.group_relays)}")
+            print()
+        if input("Accept all pending welcomes? [y/N] ").strip().lower() == "y":
+            for w in pending:
+                try:
+                    instance.accept_welcome(w)
+                    print(f"  accepted: {w.group_name or w.mls_group_id[:16]}")
+                except Exception as e:
+                    print(f"  error accepting {w.group_name or w.mls_group_id[:16]}: {e}")
         return 0
-    return _run(_work())
+
+    groups = instance.get_groups()
+    if groups:
+        print(f"no pending welcomes ({len(groups)} active group(s))")
+    else:
+        print("no pending welcomes")
+    return 0
+
+
+def _cmd_profile_set(name: str | None, about: str | None, picture: str | None) -> int:
+    if not name and not about and not picture:
+        print("error: provide at least one of --name, --about, --picture")
+        return 2
+
+    from nostr_sdk import SecretKey, Keys, UnsignedEvent
+    import time
+
+    npub, pubkey_hex = _get_identity()
+    identity_path = Path(os.getenv("MARMOT_IDENTITY_PATH") or DEFAULT_IDENTITY_PATH)
+    raw_sk = identity_path.read_bytes()
+    sk = SecretKey.from_bytes(raw_sk)
+    keys = Keys(sk)
+
+    profile = {}
+    if name:
+        profile["name"] = name
+    if about:
+        profile["about"] = about
+    if picture:
+        profile["picture"] = picture
+
+    unsigned = UnsignedEvent.from_json(json.dumps({
+        "kind": 0,
+        "content": json.dumps(profile),
+        "tags": [],
+        "pubkey": pubkey_hex,
+        "created_at": int(time.time()),
+    }))
+    event = unsigned.sign_with_keys(keys)
+    event_json = event.as_json()
+
+    async def _publish():
+        relays = _get_relays()
+        await relays.connect_all()
+        await relays.publish_all(event_json)
+        await relays.disconnect_all()
+
+    try:
+        asyncio.run(_publish())
+    except KeyboardInterrupt:
+        return 130
+
+    print(f"published kind 0 for {npub}")
+    return 0
